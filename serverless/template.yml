@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Lambdas, API Gateway Endpoint,Fargate task, SNS topics for NFT processing
+Parameters:
+  pEmail:
+    Type: String
+    Description: Email id of the NFT creator
+  pSubnetId:
+    Type: String
+    Description: Public subnet id
+  pNftBucketName:
+    Type: String
+    Description: Bucket where NFT Metadata will be stored
+  pConfirmationBlocks:
+    Type: String 
+    Default: 50
+    Description: Number of confirmation blocks to wait
+  pClusterName:
+    Type: String
+    Description: Name of ECS Cluster
+  pContainerName:
+    Type: String
+    Description: Container name
+    Default: "rinkeby"
+  pRepositoryName:
+    Type: String
+    Default: "nftrepository"
+  pIpRangeWhitelist:
+    Type: String
+    Description: IP range that is allowed to invoke the nftapi
+  pNetworkId:
+    Type: String
+    Default: "n-ethereum-rinkeby"
+  pInstanceType:
+    Type: String
+    Default: "bc.t3.large"
+  pAvailabilityZone:
+    Type: String
+Resources:
+  EthereumNode:
+    Type: "AWS::ManagedBlockchain::Node"
+    Properties:
+      NetworkId: !Ref pNetworkId
+      NodeConfiguration:
+        InstanceType: !Ref pInstanceType
+        AvailabilityZone: !Ref pAvailabilityZone
+  nfMetadataBucket:
+   Type: AWS::S3::Bucket
+   Properties:
+      BucketName: !Join ['-', [!Ref AWS::AccountId,!Ref pNftBucketName]]
+  invokeFargateTask:
+    Type: AWS::Serverless::Function
+    Properties:
+      Environment:
+        Variables:
+          clusterName: !Ref pClusterName
+          subnetId: !Ref pSubnetId
+          containerName: !Ref pContainerName
+          taskDefinition: !Ref taskDefinition
+          confirmationBlocks: !Ref pConfirmationBlocks 
+          nodeId: !GetAtt EthereumNode.NodeId
+          networkId: !GetAtt EthereumNode.NetworkId
+          snsTopic: !Ref ethConfirmationTopic
+      CodeUri: lambdas/txconfirmation/.
+      Handler: index.handler
+      Runtime: nodejs14.x
+      Description: Invoke fargate task to confirm eth txn
+      Timeout: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambda_ReadOnlyAccess
+        - EcsRunTaskPolicy:
+            TaskDefinition: !Select [1, !Split ["/", !Ref taskDefinition]]
+        - Version: "2012-10-17"
+          Statement:
+            - Action: iam:PassRole
+              Effect: Allow
+              Resource: 
+                 - !GetAtt taskRole.Arn
+                 - !GetAtt executionRole.Arn
+              Condition:
+                StringLike:
+                  iam:PassedToService: ecs-tasks.amazonaws.com
+
+  ethTxnTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "ethereum-txn-id"
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt invokeFargateTask.Arn
+  ethConfirmationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "ethereum-confirmation"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref pEmail
+
+  topicPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref invokeFargateTask
+      Principal: sns.amazonaws.com
+       
+  nftapi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: nftapi
+      TracingEnabled: true
+      OpenApiVersion: 3.0.2
+      Auth:
+        ResourcePolicy:
+          IpRangeWhitelist: 
+            - !Ref pIpRangeWhitelist
+  nftmain:
+    Type: AWS::Serverless::Function
+    Properties:
+      Environment:
+       Variables:
+         snsTopic: !Ref ethTxnTopic
+         nodeId: !GetAtt EthereumNode.NodeId
+         networkId: !GetAtt EthereumNode.NetworkId
+         bucketName: !Ref nfMetadataBucket
+         pvtkey: "ethSystemKey"
+      Handler: index.handler
+      Runtime: nodejs14.x
+      CodeUri: lambdas/nftmain/.
+      Description: Call the AWS Lambda API for NFT
+      Timeout: 10
+      # Function's execution role
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambda_ReadOnlyAccess
+        - AmazonManagedBlockchainFullAccess 
+        - AmazonSSMReadOnlyAccess
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ethTxnTopic.TopicName
+        - S3WritePolicy:
+            BucketName: !Ref nfMetadataBucket
+      Events:
+        postEndpoint:
+          Type: Api
+          Properties:
+            RestApiId: !Ref nftapi
+            Path: /
+            Method: POST
+  ecrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+     RepositoryName: !Ref pRepositoryName
+  cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref pClusterName
+  taskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join ['', [!Ref pClusterName, taskDefinition]]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 0.5GB
+      ExecutionRoleArn: !GetAtt executionRole.Arn
+      TaskRoleArn: !Ref taskRole
+      ContainerDefinitions:
+        - Name: !Ref pContainerName
+          Image: !GetAtt ecrRepository.RepositoryUri
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref logGroup
+              awslogs-stream-prefix: ecs
+  logGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/ecs/, !Ref pClusterName, taskDefinition]]
+  executionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref pClusterName, executionRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+  taskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref pClusterName, taskRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: sns 
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  -  sns:Publish
+                Resource: !Ref ethConfirmationTopic
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+        - 'arn:aws:iam::aws:policy/AmazonManagedBlockchainFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess'
+Outputs:
+  invokeFargateTaskName:
+    Value: !Ref invokeFargateTask
+
+  topicName:
+    Value: !GetAtt ethTxnTopic.TopicName
+
+  txTopicARN:
+    Value: !Ref ethTxnTopic
+
+  nftmainName:
+    Value: !Ref nftmain
+
+  nftApi:
+    Value: !Ref nftapi
+
+  ecrRepositoryURI:
+    Value: !GetAtt ecrRepository.RepositoryUri
+
+  NetworkId:
+    Description: Network Id
+    Value: !GetAtt EthereumNode.NetworkId
+
+  NodeId:
+    Description: Node Id
+    Value: !GetAtt EthereumNode.NodeId

@@ -1,0 +1,16 @@
+{
+  "name": "nft-amb-backend",
+  "version": "1.0.0",
+  "private": true,
+  "authors": [
+    " Pravinchandra Varma ",
+    "Forrest Colyer"
+  ],
+  "dependencies": {
+    "aws-web3-http-provider": "*",
+    "ethers": "^5.5.1",
+    "web3": "^1.3.5-rc.0",
+    "web3-providers-http": "^1.6.0",
+    "xhr2": "^0.2.1"
+  }
+}
