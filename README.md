@@ -25,7 +25,7 @@ The repo is structured as follows:
 2.	AWS SAM CLI : Install the AWS SAM CLI.
 3.	Node.js: Install Node.js 14, including the npm package management tool.
 4.	Docker: Install Docker community edition.
-5.       Ensure you have permissions to make objects in the S3 bucket public
+5.      Ensure you have permissions to make objects in the S3 bucket public
     
 ### Deploy Ethereum node and Serverless components
 
